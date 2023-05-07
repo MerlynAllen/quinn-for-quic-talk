@@ -18,14 +18,14 @@ use tracing::{info_span, trace};
 
 use super::*;
 
-pub(super) const DEFAULT_MAX_UDP_PAYLOAD_SIZE: usize = 1200;
+pub(super) const DEFAULT_MTU: usize = 1200;
 
 pub(super) struct Pair {
     pub(super) server: TestEndpoint,
     pub(super) client: TestEndpoint,
     pub(super) time: Instant,
     /// Simulates the maximum size allowed for UDP payloads by the link (packets exceeding this size will be dropped)
-    pub(super) max_udp_payload_size: usize,
+    pub(super) mtu: usize,
     // One-way
     pub(super) latency: Duration,
     /// Number of spin bit flips
@@ -35,8 +35,8 @@ pub(super) struct Pair {
 
 impl Pair {
     pub(super) fn new(endpoint_config: Arc<EndpointConfig>, server_config: ServerConfig) -> Self {
-        let server = Endpoint::new(endpoint_config.clone(), Some(Arc::new(server_config)));
-        let client = Endpoint::new(endpoint_config, None);
+        let server = Endpoint::new(endpoint_config.clone(), Some(Arc::new(server_config)), true);
+        let client = Endpoint::new(endpoint_config, None, true);
 
         Self::new_from_endpoint(client, server)
     }
@@ -54,7 +54,7 @@ impl Pair {
             server: TestEndpoint::new(server, server_addr),
             client: TestEndpoint::new(client, client_addr),
             time: Instant::now(),
-            max_udp_payload_size: DEFAULT_MAX_UDP_PAYLOAD_SIZE,
+            mtu: DEFAULT_MTU,
             latency: Duration::new(0, 0),
             spins: 0,
             last_spin: false,
@@ -115,7 +115,7 @@ impl Pair {
         let _guard = span.enter();
         self.client.drive(self.time, self.server.addr);
         for x in self.client.outbound.drain(..) {
-            if packet_size(&x) > self.max_udp_payload_size {
+            if packet_size(&x) > self.mtu {
                 info!(
                     packet_size = packet_size(&x),
                     "dropping packet (max size exceeded)"
@@ -143,7 +143,7 @@ impl Pair {
         let _guard = span.enter();
         self.server.drive(self.time, self.client.addr);
         for x in self.server.outbound.drain(..) {
-            if packet_size(&x) > self.max_udp_payload_size {
+            if packet_size(&x) > self.mtu {
                 info!(
                     packet_size = packet_size(&x),
                     "dropping packet (max size exceeded)"
@@ -430,11 +430,7 @@ impl Write for TestWriter {
 }
 
 pub(super) fn server_config() -> ServerConfig {
-    let mut config = ServerConfig::with_crypto(Arc::new(server_crypto()));
-    Arc::get_mut(&mut config.transport)
-        .unwrap()
-        .mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
-    config
+    ServerConfig::with_crypto(Arc::new(server_crypto()))
 }
 
 pub(super) fn server_config_with_cert(cert: Certificate, key: PrivateKey) -> ServerConfig {
@@ -452,11 +448,7 @@ pub(super) fn server_crypto_with_cert(cert: Certificate, key: PrivateKey) -> rus
 }
 
 pub(super) fn client_config() -> ClientConfig {
-    let mut config = ClientConfig::new(Arc::new(client_crypto()));
-    Arc::get_mut(&mut config.transport)
-        .unwrap()
-        .mtu_discovery_config(Some(MtuDiscoveryConfig::default()));
-    config
+    ClientConfig::new(Arc::new(client_crypto()))
 }
 
 pub(super) fn client_config_with_certs(certs: Vec<rustls::Certificate>) -> ClientConfig {

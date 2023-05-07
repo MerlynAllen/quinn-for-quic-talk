@@ -28,8 +28,8 @@ use crate::{
         EndpointEventInner, IssuedCid,
     },
     transport_parameters::TransportParameters,
-    ResetToken, RetryToken, Side, Transmit, TransportConfig, TransportError,
-    INITIAL_MAX_UDP_PAYLOAD_SIZE, MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE,
+    ResetToken, RetryToken, Side, Transmit, TransportConfig, TransportError, INITIAL_MTU,
+    MAX_CID_SIZE, MIN_INITIAL_SIZE, RESET_TOKEN_SIZE,
 };
 
 /// The main entry point to the library
@@ -61,13 +61,21 @@ pub struct Endpoint {
     local_cid_generator: Box<dyn ConnectionIdGenerator>,
     config: Arc<EndpointConfig>,
     server_config: Option<Arc<ServerConfig>>,
+    /// Whether the underlying UDP socket promises not to fragment packets
+    allow_mtud: bool,
 }
 
 impl Endpoint {
     /// Create a new endpoint
     ///
-    /// Returns `Err` if the configuration is invalid.
-    pub fn new(config: Arc<EndpointConfig>, server_config: Option<Arc<ServerConfig>>) -> Self {
+    /// `allow_mtud` enables path MTU detection when requested by `Connection` configuration for
+    /// better performance. This requires that outgoing packets are never fragmented, which can be
+    /// achieved via e.g. the `IPV6_DONTFRAG` socket option.
+    pub fn new(
+        config: Arc<EndpointConfig>,
+        server_config: Option<Arc<ServerConfig>>,
+        allow_mtud: bool,
+    ) -> Self {
         Self {
             rng: StdRng::from_entropy(),
             transmits: VecDeque::new(),
@@ -79,6 +87,7 @@ impl Endpoint {
             local_cid_generator: (config.connection_id_generator_factory.as_ref())(),
             config,
             server_config,
+            allow_mtud,
         }
     }
 
@@ -642,6 +651,7 @@ impl Endpoint {
             self.local_cid_generator.as_ref(),
             now,
             version,
+            self.allow_mtud,
         );
 
         let id = self.connections.insert(ConnectionMeta {
@@ -681,9 +691,8 @@ impl Endpoint {
 
         let mut buf = Vec::<u8>::new();
         let partial_encode = header.encode(&mut buf);
-        let max_len = INITIAL_MAX_UDP_PAYLOAD_SIZE as usize
-            - partial_encode.header_len
-            - crypto.packet.local.tag_len();
+        let max_len =
+            INITIAL_MTU as usize - partial_encode.header_len - crypto.packet.local.tag_len();
         frame::Close::from(reason).encode(&mut buf, max_len);
         buf.resize(buf.len() + crypto.packet.local.tag_len(), 0);
         partial_encode.finish(

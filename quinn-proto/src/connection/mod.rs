@@ -64,7 +64,7 @@ use spaces::Retransmits;
 use spaces::{PacketSpace, SendableFrames, SentPacket, ThinRetransmits};
 
 mod stats;
-pub use stats::ConnectionStats;
+pub use stats::{ConnectionStats, FrameStats, PathStats, UdpStats};
 
 mod streams;
 #[cfg(fuzzing)]
@@ -236,6 +236,7 @@ impl Connection {
         cid_gen: &dyn ConnectionIdGenerator,
         now: Instant,
         version: u32,
+        allow_mtud: bool,
     ) -> Self {
         let side = if server_config.is_some() {
             Side::Server
@@ -263,10 +264,16 @@ impl Connection {
             path: PathData::new(
                 remote,
                 config.initial_rtt,
-                config.congestion_controller_factory.build(now),
-                config.initial_max_udp_payload_size,
+                config
+                    .congestion_controller_factory
+                    .build(now, config.get_initial_mtu()),
+                config.get_initial_mtu(),
+                config.min_mtu,
                 None,
-                config.mtu_discovery_config.clone(),
+                match allow_mtud {
+                    true => config.mtu_discovery_config.clone(),
+                    false => None,
+                },
                 now,
                 path_validated,
             ),
@@ -1220,7 +1227,13 @@ impl Connection {
                 ack_eliciting_acked |= info.ack_eliciting;
 
                 // Notify MTU discovery that a packet was acked, because it might be an MTU probe
-                self.path.mtud.on_acked(space, packet, info.size);
+                let mtu_updated = self.path.mtud.on_acked(space, packet, info.size);
+                if mtu_updated {
+                    self.path
+                        .congestion
+                        .on_mtu_update(self.path.mtud.current_mtu());
+                }
+
                 self.on_packet_acked(now, space, info);
             }
         }
@@ -1470,6 +1483,7 @@ impl Connection {
                 lost_packets,
                 size_of_lost_packets
             );
+
             for packet in &lost_packets {
                 let info = self.spaces[pn_space].sent_packets.remove(packet).unwrap(); // safe: lost_packets is populated just above
                 self.remove_in_flight(pn_space, &info);
@@ -1477,8 +1491,13 @@ impl Connection {
                     self.streams.retransmit(frame);
                 }
                 self.spaces[pn_space].pending |= info.retransmits;
-                self.path.mtud.on_non_probe_lost(now, *packet, info.size);
+                self.path.mtud.on_non_probe_lost(*packet, info.size);
             }
+
+            if self.path.mtud.black_hole_detected(now) {
+                self.stats.path.black_holes_detected += 1;
+            }
+
             // Don't apply congestion penalty for lost ack-only packets
             let lost_ack_eliciting = old_bytes_in_flight != self.in_flight.bytes;
 
@@ -2722,8 +2741,11 @@ impl Connection {
             PathData::new(
                 remote,
                 self.config.initial_rtt,
-                self.config.congestion_controller_factory.build(now),
-                self.config.initial_max_udp_payload_size,
+                self.config
+                    .congestion_controller_factory
+                    .build(now, self.config.get_initial_mtu()),
+                self.config.get_initial_mtu(),
+                self.config.min_mtu,
                 Some(peer_max_udp_payload_size),
                 self.config.mtu_discovery_config.clone(),
                 now,

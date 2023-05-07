@@ -6,16 +6,17 @@
 use std::os::unix::io::AsRawFd;
 #[cfg(windows)]
 use std::os::windows::io::AsRawSocket;
+#[cfg(not(windows))]
+use std::sync::atomic::AtomicBool;
 use std::{
     net::{IpAddr, Ipv6Addr, SocketAddr},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         Mutex,
     },
     time::{Duration, Instant},
 };
 
-use proto::{EcnCodepoint, Transmit};
 use tracing::warn;
 
 #[cfg(unix)]
@@ -34,6 +35,14 @@ mod imp;
 mod imp;
 
 pub use imp::UdpSocketState;
+
+/// Whether transmitted datagrams might get fragmented by the IP layer
+///
+/// Returns `false` on targets which employ e.g. the `IPV6_DONTFRAG` socket option.
+#[inline]
+pub fn may_fragment() -> bool {
+    imp::may_fragment()
+}
 
 /// Number of UDP packets to send/receive at a time
 pub const BATCH_SIZE: usize = imp::BATCH_SIZE;
@@ -86,7 +95,7 @@ impl UdpState {
 
     /// Sets the flag indicating we got EINVAL error from `sendmsg` or `sendmmsg` syscall.
     #[inline]
-    #[cfg(not(windows))]
+    #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
     fn set_sendmsg_einval(&self) {
         self.sendmsg_einval.store(true, Ordering::Relaxed)
     }
@@ -119,6 +128,22 @@ impl Default for RecvMeta {
             dst_ip: None,
         }
     }
+}
+
+/// An outgoing packet
+#[derive(Debug)]
+pub struct Transmit {
+    /// The socket this datagram should be sent to
+    pub destination: SocketAddr,
+    /// Explicit congestion notification bits to set on the packet
+    pub ecn: Option<EcnCodepoint>,
+    /// Contents of the datagram
+    pub contents: Vec<u8>,
+    /// The segment size if this transmission contains multiple datagrams.
+    /// This is `None` if the transmit only contains a single datagram
+    pub segment_size: Option<usize>,
+    /// Optional source IP address for the datagram
+    pub src_ip: Option<IpAddr>,
 }
 
 /// Log at most 1 IO error per minute
@@ -167,5 +192,32 @@ where
 {
     fn from(socket: &'s S) -> Self {
         Self(socket.into())
+    }
+}
+
+/// Explicit congestion notification codepoint
+#[repr(u8)]
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+pub enum EcnCodepoint {
+    #[doc(hidden)]
+    Ect0 = 0b10,
+    #[doc(hidden)]
+    Ect1 = 0b01,
+    #[doc(hidden)]
+    Ce = 0b11,
+}
+
+impl EcnCodepoint {
+    /// Create new object from the given bits
+    pub fn from_bits(x: u8) -> Option<Self> {
+        use self::EcnCodepoint::*;
+        Some(match x & 0b11 {
+            0b10 => Ect0,
+            0b01 => Ect1,
+            0b11 => Ce,
+            _ => {
+                return None;
+            }
+        })
     }
 }

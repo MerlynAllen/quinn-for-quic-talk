@@ -9,8 +9,7 @@ use std::{
     time::Instant,
 };
 
-use proto::Transmit;
-use udp::{RecvMeta, UdpState};
+use udp::{RecvMeta, Transmit, UdpState};
 
 /// Abstracts I/O and timer operations for runtime independence
 pub trait Runtime: Send + Sync + Debug + 'static {
@@ -51,6 +50,14 @@ pub trait AsyncUdpSocket: Send + Debug + 'static {
 
     /// Look up the local IP address and port used by this socket
     fn local_addr(&self) -> io::Result<SocketAddr>;
+
+    /// Whether datagrams might get fragmented into multiple parts
+    ///
+    /// Sockets should prevent this for best performance. See e.g. the `IPV6_DONTFRAG` socket
+    /// option.
+    fn may_fragment(&self) -> bool {
+        true
+    }
 }
 
 /// Automatically select an appropriate runtime from those enabled at compile time

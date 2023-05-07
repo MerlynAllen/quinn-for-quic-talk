@@ -25,7 +25,7 @@ use util::*;
 fn version_negotiate_server() {
     let _guard = subscribe();
     let client_addr = "[::2]:7890".parse().unwrap();
-    let mut server = Endpoint::new(Default::default(), Some(Arc::new(server_config())));
+    let mut server = Endpoint::new(Default::default(), Some(Arc::new(server_config())), true);
     let now = Instant::now();
     let event = server.handle(
         now,
@@ -61,6 +61,7 @@ fn version_negotiate_client() {
             ..Default::default()
         }),
         None,
+        true,
     );
     let (_, mut client_ch) = client
         .connect(client_config(), server_addr, "localhost")
@@ -176,7 +177,7 @@ fn server_stateless_reset() {
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
     let (client_ch, _) = pair.connect();
     pair.drive(); // Flush any post-handshake frames
-    pair.server.endpoint = Endpoint::new(endpoint_config, Some(Arc::new(server_config())));
+    pair.server.endpoint = Endpoint::new(endpoint_config, Some(Arc::new(server_config())), true);
     // Force the server to generate the smallest possible stateless reset
     pair.client.connections.get_mut(&client_ch).unwrap().ping();
     info!("resetting");
@@ -201,7 +202,7 @@ fn client_stateless_reset() {
 
     let mut pair = Pair::new(endpoint_config.clone(), server_config());
     let (_, server_ch) = pair.connect();
-    pair.client.endpoint = Endpoint::new(endpoint_config, Some(Arc::new(server_config())));
+    pair.client.endpoint = Endpoint::new(endpoint_config, Some(Arc::new(server_config())), true);
     // Send something big enough to allow room for a smaller stateless reset.
     pair.server.connections.get_mut(&server_ch).unwrap().close(
         pair.time,
@@ -1323,8 +1324,9 @@ fn cid_rotation() {
             ..EndpointConfig::default()
         }),
         Some(Arc::new(server_config())),
+        true,
     );
-    let client = Endpoint::new(Arc::new(EndpointConfig::default()), None);
+    let client = Endpoint::new(Arc::new(EndpointConfig::default()), None, true);
 
     let mut pair = Pair::new_from_endpoint(client, server);
     let (_, server_ch) = pair.connect();
@@ -1902,7 +1904,7 @@ fn big_cert_and_key() -> (rustls::Certificate, rustls::PrivateKey) {
 fn malformed_token_len() {
     let _guard = subscribe();
     let client_addr = "[::2]:7890".parse().unwrap();
-    let mut server = Endpoint::new(Default::default(), Some(Arc::new(server_config())));
+    let mut server = Endpoint::new(Default::default(), Some(Arc::new(server_config())), true);
     server.handle(
         Instant::now(),
         client_addr,
@@ -1920,7 +1922,7 @@ fn connect_too_low_mtu() {
     let mut pair = Pair::default();
 
     // The maximum payload size is lower than 1200, so no packages will get through!
-    pair.max_udp_payload_size = 1000;
+    pair.mtu = 1000;
 
     pair.begin_connect(client_config());
     pair.drive();
@@ -1957,7 +1959,7 @@ fn connect_detects_mtu() {
     for &(pair_max_udp, expected_mtu) in max_udp_payload_and_expected_mtu {
         println!("Trying {pair_max_udp}");
         let mut pair = Pair::default();
-        pair.max_udp_payload_size = pair_max_udp;
+        pair.mtu = pair_max_udp;
         let (client_ch, server_ch) = pair.connect();
         pair.drive();
 
@@ -1977,14 +1979,15 @@ fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
     let server = Endpoint::new(
         Arc::new(server_endpoint_config),
         Some(Arc::new(server_config())),
+        true,
     );
     let client_endpoint_config = EndpointConfig {
         max_udp_payload_size: VarInt::from(client_max_udp_payload_size),
         ..EndpointConfig::default()
     };
-    let client = Endpoint::new(Arc::new(client_endpoint_config), None);
+    let client = Endpoint::new(Arc::new(client_endpoint_config), None, true);
     let mut pair = Pair::new_from_endpoint(client, server);
-    pair.max_udp_payload_size = 1300;
+    pair.mtu = 1300;
 
     // Connect
     let (client_ch, server_ch) = pair.connect();
@@ -1996,7 +1999,7 @@ fn migrate_detects_new_mtu_and_respects_original_peer_max_udp_payload_size() {
     assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), 1300);
 
     // Migrate client to a different port (and simulate a higher path MTU)
-    pair.max_udp_payload_size = 1500;
+    pair.mtu = 1500;
     pair.client.addr = SocketAddr::new(
         Ipv4Addr::new(127, 0, 0, 1).into(),
         CLIENT_PORTS.lock().unwrap().next().unwrap(),
@@ -2037,7 +2040,7 @@ fn connect_runs_mtud_again_after_600_seconds() {
         .max_idle_timeout(None);
 
     let mut pair = Pair::new(Default::default(), server_config);
-    pair.max_udp_payload_size = 1400;
+    pair.mtu = 1400;
     let (client_ch, server_ch) = pair.connect_with(client_config);
     pair.drive();
 
@@ -2053,7 +2056,7 @@ fn connect_runs_mtud_again_after_600_seconds() {
 
     // Sanity check: the mtu does not change after the fact, even though the link now supports a
     // higher udp payload size
-    pair.max_udp_payload_size = 1500;
+    pair.mtu = 1500;
     pair.drive();
     assert_eq!(pair.client_conn_mut(client_ch).path_mtu(), 1389);
     assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), 1389);
@@ -2079,7 +2082,7 @@ fn packet_loss_and_retry_too_low_mtu() {
     pair.drive();
 
     // Nothing will get past this mtu
-    pair.max_udp_payload_size = 10;
+    pair.mtu = 10;
     pair.client_send(client_ch, s).write(b" world").unwrap();
     pair.drive_client();
 
@@ -2088,7 +2091,7 @@ fn packet_loss_and_retry_too_low_mtu() {
     assert!(pair.server.inbound.is_empty());
 
     // Restore the default mtu, so future packets are properly transmitted
-    pair.max_udp_payload_size = DEFAULT_MAX_UDP_PAYLOAD_SIZE;
+    pair.mtu = DEFAULT_MTU;
 
     // The lost packet is resent
     pair.drive();
@@ -2104,7 +2107,7 @@ fn packet_loss_and_retry_too_low_mtu() {
 fn blackhole_after_mtu_change_repairs_itself() {
     let _guard = subscribe();
     let mut pair = Pair::default();
-    pair.max_udp_payload_size = 1500;
+    pair.mtu = 1500;
     let (client_ch, server_ch) = pair.connect();
     pair.drive();
 
@@ -2113,7 +2116,7 @@ fn blackhole_after_mtu_change_repairs_itself() {
     assert_eq!(pair.server_conn_mut(server_ch).path_mtu(), 1452);
 
     // Back to the base MTU
-    pair.max_udp_payload_size = 1200;
+    pair.mtu = 1200;
 
     // The payload will be sent in a single packet, because the detected MTU was 1444, but it will
     // be dropped because the link no longer supports that packet size!
@@ -2136,6 +2139,7 @@ fn blackhole_after_mtu_change_repairs_itself() {
     let client_stats = pair.client_conn_mut(client_ch).stats();
     assert!(client_stats.path.lost_packets >= 3);
     assert!(client_stats.path.congestion_events >= 3);
+    assert_eq!(client_stats.path.black_holes_detected, 1);
 }
 
 #[test]
@@ -2165,7 +2169,7 @@ fn packet_splitting_not_necessary_after_higher_mtu_discovered() {
     let payload = vec![42; 1300];
 
     let mut pair = Pair::default();
-    pair.max_udp_payload_size = 1500;
+    pair.mtu = 1500;
 
     let (client_ch, _) = pair.connect();
     pair.drive();

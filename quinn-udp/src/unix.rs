@@ -13,10 +13,12 @@ use std::{
     time::Instant,
 };
 
-use proto::{EcnCodepoint, Transmit};
 use socket2::SockRef;
 
-use super::{cmsg, log_sendmsg_error, RecvMeta, UdpSockRef, UdpState, IO_ERROR_LOG_INTERVAL};
+use super::{
+    cmsg, log_sendmsg_error, EcnCodepoint, RecvMeta, Transmit, UdpSockRef, UdpState,
+    IO_ERROR_LOG_INTERVAL,
+};
 
 #[cfg(target_os = "freebsd")]
 type IpTosTy = libc::c_uchar;
@@ -123,6 +125,12 @@ fn init(io: SockRef<'_>) -> io::Result<()> {
             )?;
         }
     }
+    #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "ios"))]
+    {
+        if is_ipv4 {
+            set_socket_option(&*io, libc::IPPROTO_IP, libc::IP_DONTFRAG, OPTION_ON)?;
+        }
+    }
     #[cfg(any(target_os = "freebsd", target_os = "macos"))]
     // IP_RECVDSTADDR == IP_SENDSRCADDR on FreeBSD
     // macOS uses only IP_RECVDSTADDR, no IP_SENDSRCADDR on macOS
@@ -133,14 +141,14 @@ fn init(io: SockRef<'_>) -> io::Result<()> {
         }
     }
 
-    // IPV6_RECVPKTINFO is standardized
+    // Options standardized in RFC 3542
     if !is_ipv4 {
         set_socket_option(&*io, libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO, OPTION_ON)?;
         set_socket_option(&*io, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, OPTION_ON)?;
-    }
-
-    if !is_ipv4 {
-        set_socket_option(&*io, libc::IPPROTO_IPV6, libc::IPV6_RECVTCLASS, OPTION_ON)?;
+        // Linux's IP_PMTUDISC_PROBE allows us to operate under interface MTU rather than the
+        // kernel's path MTU guess, but actually disabling fragmentation requires this too. See
+        // __ip6_append_data in ip6_output.c.
+        set_socket_option(&*io, libc::IPPROTO_IPV6, libc::IPV6_DONTFRAG, OPTION_ON)?;
     }
 
     Ok(())
@@ -154,7 +162,7 @@ fn send(
     last_send_error: &Mutex<Instant>,
     transmits: &[Transmit],
 ) -> io::Result<usize> {
-    #[allow(unused_mut)] // only mutable on FeeBSD
+    #[allow(unused_mut)] // only mutable on FreeBSD
     let mut encode_src_ip = true;
     #[cfg(target_os = "freebsd")]
     {
@@ -314,9 +322,23 @@ unsafe fn sendmmsg_with_fallback(
     vlen: libc::c_uint,
 ) -> libc::c_int {
     let flags = 0;
-    let ret = libc::syscall(libc::SYS_sendmmsg, sockfd, msgvec, vlen, flags) as libc::c_int;
-    if ret != -1 {
-        return ret;
+
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let ret = libc::syscall(libc::SYS_sendmmsg, sockfd, msgvec, vlen, flags) as libc::c_int;
+        if ret != -1 {
+            return ret;
+        }
+    }
+
+    // libc on FreeBSD implements `sendmmsg` as a high-level abstraction over `sendmsg`,
+    // thus `SYS_sendmmsg` constant and direct system call do not exist
+    #[cfg(target_os = "freebsd")]
+    {
+        let ret = libc::sendmmsg(sockfd, msgvec, vlen as usize, flags) as libc::c_int;
+        if ret != -1 {
+            return ret;
+        }
     }
 
     let e = io::Error::last_os_error();
@@ -347,7 +369,9 @@ unsafe fn sendmmsg_fallback(
     if n == -1 {
         -1
     } else {
-        (*msgvec).msg_len = n as libc::c_uint;
+        // type of `msg_len` field differs on Linux and FreeBSD,
+        // it is up to the compiler to infer and cast `n` to correct type
+        (*msgvec).msg_len = n as _;
         1
     }
 }
@@ -426,10 +450,24 @@ unsafe fn recvmmsg_with_fallback(
 ) -> libc::c_int {
     let flags = 0;
     let timeout = ptr::null_mut::<libc::timespec>();
-    let ret =
-        libc::syscall(libc::SYS_recvmmsg, sockfd, msgvec, vlen, flags, timeout) as libc::c_int;
-    if ret != -1 {
-        return ret;
+
+    #[cfg(not(target_os = "freebsd"))]
+    {
+        let ret =
+            libc::syscall(libc::SYS_recvmmsg, sockfd, msgvec, vlen, flags, timeout) as libc::c_int;
+        if ret != -1 {
+            return ret;
+        }
+    }
+
+    // libc on FreeBSD implements `recvmmsg` as a high-level abstraction over `recvmsg`,
+    // thus `SYS_recvmmsg` constant and direct system call do not exist
+    #[cfg(target_os = "freebsd")]
+    {
+        let ret = libc::recvmmsg(sockfd, msgvec, vlen as usize, flags, timeout) as libc::c_int;
+        if ret != -1 {
+            return ret;
+        }
     }
 
     let e = io::Error::last_os_error();
@@ -460,7 +498,9 @@ unsafe fn recvmmsg_fallback(
     if n == -1 {
         -1
     } else {
-        (*msgvec).msg_len = n as libc::c_uint;
+        // type of `msg_len` field differs on Linux and FreeBSD,
+        // it is up to the compiler to infer and cast `n` to correct type
+        (*msgvec).msg_len = n as _;
         1
     }
 }
@@ -664,6 +704,11 @@ pub(crate) const BATCH_SIZE: usize = 32;
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 pub(crate) const BATCH_SIZE: usize = 1;
+
+#[inline]
+pub(crate) fn may_fragment() -> bool {
+    false
+}
 
 #[cfg(target_os = "linux")]
 mod gso {

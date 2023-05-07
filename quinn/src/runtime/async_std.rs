@@ -53,7 +53,7 @@ impl AsyncUdpSocket for UdpSocket {
         &self,
         state: &udp::UdpState,
         cx: &mut Context,
-        transmits: &[proto::Transmit],
+        transmits: &[udp::Transmit],
     ) -> Poll<io::Result<usize>> {
         loop {
             ready!(self.io.poll_writable(cx))?;
@@ -79,5 +79,9 @@ impl AsyncUdpSocket for UdpSocket {
 
     fn local_addr(&self) -> io::Result<std::net::SocketAddr> {
         self.io.as_ref().local_addr()
+    }
+
+    fn may_fragment(&self) -> bool {
+        udp::may_fragment()
     }
 }

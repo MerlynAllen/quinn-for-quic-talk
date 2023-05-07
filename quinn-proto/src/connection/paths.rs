@@ -37,7 +37,8 @@ impl PathData {
         remote: SocketAddr,
         initial_rtt: Duration,
         congestion: Box<dyn congestion::Controller>,
-        initial_max_udp_payload_size: u16,
+        initial_mtu: u16,
+        min_mtu: u16,
         peer_max_udp_payload_size: Option<u16>,
         mtud_config: Option<MtuDiscoveryConfig>,
         now: Instant,
@@ -47,28 +48,16 @@ impl PathData {
             remote,
             rtt: RttEstimator::new(initial_rtt),
             sending_ecn: true,
-            pacing: Pacer::new(
-                initial_rtt,
-                congestion.initial_window(),
-                initial_max_udp_payload_size,
-                now,
-            ),
+            pacing: Pacer::new(initial_rtt, congestion.initial_window(), initial_mtu, now),
             congestion,
             challenge: None,
             challenge_pending: false,
             validated,
             total_sent: 0,
             total_recvd: 0,
-            mtud: mtud_config.map_or(
-                MtuDiscovery::disabled(initial_max_udp_payload_size),
-                |config| {
-                    MtuDiscovery::new(
-                        initial_max_udp_payload_size,
-                        peer_max_udp_payload_size,
-                        config,
-                    )
-                },
-            ),
+            mtud: mtud_config.map_or(MtuDiscovery::disabled(initial_mtu, min_mtu), |config| {
+                MtuDiscovery::new(initial_mtu, min_mtu, peer_max_udp_payload_size, config)
+            }),
             first_packet_after_rtt_sample: None,
         }
     }

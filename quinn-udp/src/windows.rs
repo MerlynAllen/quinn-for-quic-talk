@@ -6,10 +6,9 @@ use std::{
     time::Instant,
 };
 
-use proto::Transmit;
 use windows_sys::Win32::Networking::WinSock;
 
-use super::{log_sendmsg_error, RecvMeta, UdpSockRef, UdpState, IO_ERROR_LOG_INTERVAL};
+use super::{log_sendmsg_error, RecvMeta, Transmit, UdpSockRef, UdpState, IO_ERROR_LOG_INTERVAL};
 
 /// QUIC-friendly UDP interface for Windows
 #[derive(Debug)]
@@ -155,3 +154,8 @@ pub fn udp_state() -> super::UdpState {
 }
 
 pub const BATCH_SIZE: usize = 1;
+
+#[inline]
+pub(crate) fn may_fragment() -> bool {
+    false
+}

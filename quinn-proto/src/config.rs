@@ -1,4 +1,4 @@
-use std::{convert::TryInto, fmt, num::TryFromIntError, sync::Arc, time::Duration};
+use std::{fmt, num::TryFromIntError, sync::Arc, time::Duration};
 
 use thiserror::Error;
 
@@ -9,8 +9,7 @@ use crate::{
     cid_generator::{ConnectionIdGenerator, RandomConnectionIdGenerator},
     congestion,
     crypto::{self, HandshakeTokenKey, HmacKey},
-    VarInt, VarIntBoundsExceeded, DEFAULT_SUPPORTED_VERSIONS, INITIAL_MAX_UDP_PAYLOAD_SIZE,
-    MAX_UDP_PAYLOAD,
+    VarInt, VarIntBoundsExceeded, DEFAULT_SUPPORTED_VERSIONS, INITIAL_MTU, MAX_UDP_PAYLOAD,
 };
 
 /// Parameters governing the core QUIC state machine
@@ -37,7 +36,8 @@ pub struct TransportConfig {
     pub(crate) packet_threshold: u32,
     pub(crate) time_threshold: f32,
     pub(crate) initial_rtt: Duration,
-    pub(crate) initial_max_udp_payload_size: u16,
+    pub(crate) initial_mtu: u16,
+    pub(crate) min_mtu: u16,
     pub(crate) mtu_discovery_config: Option<MtuDiscoveryConfig>,
 
     pub(crate) persistent_congestion_threshold: u32,
@@ -160,16 +160,34 @@ impl TransportConfig {
     /// (see [`TransportConfig::mtu_discovery_config`]).
     ///
     /// Must be at least 1200, which is the default, and known to be safe for typical internet
-    /// applications. Larger values are more efficient, but increase the risk of unpredictable
-    /// catastrophic packet loss due to exceeding the network path's IP MTU. If the provided value
-    /// is higher than what the network path actually supports, packet loss will eventually trigger
-    /// black hole detection and bring it down to 1200.
+    /// applications. Larger values are more efficient, but increase the risk of packet loss due to
+    /// exceeding the network path's IP MTU. If the provided value is higher than what the network
+    /// path actually supports, packet loss will eventually trigger black hole detection and bring
+    /// it down to [`TransportConfig::min_mtu`].
+    pub fn initial_mtu(&mut self, value: u16) -> &mut Self {
+        self.initial_mtu = value.max(INITIAL_MTU);
+        self
+    }
+
+    pub(crate) fn get_initial_mtu(&self) -> u16 {
+        self.initial_mtu.max(self.min_mtu)
+    }
+
+    /// The maximum UDP payload size guaranteed to be supported by the network.
+    ///
+    /// Must be at least 1200, which is the default, and lower than or equal to
+    /// [`TransportConfig::initial_mtu`].
     ///
     /// Real-world MTUs can vary according to ISP, VPN, and properties of intermediate network links
-    /// outside of either endpoint's control. Caution should be used when raising this value for
-    /// connections outside of private networks where these factors are fully controlled.
-    pub fn initial_max_udp_payload_size(&mut self, value: u16) -> &mut Self {
-        self.initial_max_udp_payload_size = value.max(INITIAL_MAX_UDP_PAYLOAD_SIZE);
+    /// outside of either endpoint's control. Extreme care should be used when raising this value
+    /// outside of private networks where these factors are fully controlled. If the provided value
+    /// is higher than what the network path actually supports, the result will be unpredictable and
+    /// catastrophic packet loss, without a possibility of repair. Prefer
+    /// [`TransportConfig::initial_mtu`] together with
+    /// [`TransportConfig::mtu_discovery_config`] to set a maximum UDP payload size that robustly
+    /// adapts to the network.
+    pub fn min_mtu(&mut self, value: u16) -> &mut Self {
+        self.min_mtu = value.max(INITIAL_MTU);
         self
     }
 
@@ -194,7 +212,7 @@ impl TransportConfig {
     /// to disable UDP packet fragmentation (this is strongly recommended by [RFC
     /// 9000](https://www.rfc-editor.org/rfc/rfc9000.html#section-14-7), regardless of MTU
     /// discovery). They can build on top of the `quinn-udp` crate, used by `quinn` itself, which
-    /// provides Linux and Windows support for disabling packet fragmentation.
+    /// provides Linux, Windows, macOS, and FreeBSD support for disabling packet fragmentation.
     pub fn mtu_discovery_config(&mut self, value: Option<MtuDiscoveryConfig>) -> &mut Self {
         self.mtu_discovery_config = value;
         self
@@ -295,8 +313,9 @@ impl Default for TransportConfig {
             packet_threshold: 3,
             time_threshold: 9.0 / 8.0,
             initial_rtt: Duration::from_millis(333), // per spec, intentionally distinct from EXPECTED_RTT
-            initial_max_udp_payload_size: INITIAL_MAX_UDP_PAYLOAD_SIZE,
-            mtu_discovery_config: None,
+            initial_mtu: INITIAL_MTU,
+            min_mtu: INITIAL_MTU,
+            mtu_discovery_config: Some(MtuDiscoveryConfig::default()),
 
             persistent_congestion_threshold: 3,
             keep_alive_interval: None,
@@ -385,7 +404,7 @@ impl fmt::Debug for TransportConfig {
 ///
 /// Since the search space for MTUs is quite big (the smallest possible MTU is 1200, and the highest
 /// is 65527), Quinn performs a binary search to keep the number of probes as low as possible. The
-/// lower bound of the search is equal to [`TransportConfig::initial_max_udp_payload_size`] in the
+/// lower bound of the search is equal to [`TransportConfig::initial_mtu`] in the
 /// initial MTU discovery run, and is equal to the currently discovered MTU in subsequent runs. The
 /// upper bound is determined by the minimum of [`MtuDiscoveryConfig::upper_bound`] and the
 /// `max_udp_payload_size` transport parameter received from the peer during the handshake.
@@ -476,7 +495,7 @@ impl EndpointConfig {
             || Box::<RandomConnectionIdGenerator>::default();
         Self {
             reset_key,
-            max_udp_payload_size: 1480u32.into(), // Typical internet MTU minus IPv4 and UDP overhead, rounded up to a multiple of 8
+            max_udp_payload_size: MAX_UDP_PAYLOAD.into(), // See RFC 9000 (https://www.rfc-editor.org/rfc/rfc9000.html#section-18.2-4.10.1)
             connection_id_generator_factory: Arc::new(cid_factory),
             supported_versions: DEFAULT_SUPPORTED_VERSIONS.to_vec(),
             grease_quic_bit: true,
@@ -508,12 +527,17 @@ impl EndpointConfig {
         self
     }
 
-    /// Maximum UDP payload size accepted from peers. Excludes UDP and IP overhead.
+    /// Maximum UDP payload size accepted from peers (excluding UDP and IP overhead).
     ///
-    /// The default is suitable for typical internet applications. Applications which expect to run
-    /// on networks supporting Ethernet jumbo frames or similar should set this appropriately.
-    pub fn max_udp_payload_size(&mut self, value: u64) -> Result<&mut Self, ConfigError> {
-        self.max_udp_payload_size = value.try_into()?;
+    /// Must be greater or equal than 1200.
+    ///
+    /// Defaults to 65527, which is the maximum permitted UDP payload.
+    pub fn max_udp_payload_size(&mut self, value: u16) -> Result<&mut Self, ConfigError> {
+        if !(1200..=65_527).contains(&value) {
+            return Err(ConfigError::OutOfBounds);
+        }
+
+        self.max_udp_payload_size = value.into();
         Ok(self)
     }
 

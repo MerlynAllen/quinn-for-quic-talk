@@ -1,8 +1,8 @@
 [package]
 name = "quinn-udp"
-version = "0.3.2"
+version = "0.4.0"
 edition = "2018"
-rust-version = "1.59"
+rust-version = "1.63"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/quinn-rs/quinn"
 description = "UDP sockets with ECN information for the QUIC transport protocol"
@@ -22,8 +22,7 @@ log = ["tracing/log"]
 maintenance = { status = "experimental" }
 
 [dependencies]
-libc = "0.2.69"
-proto = { package = "quinn-proto", path = "../quinn-proto", version = "0.10", default-features = false }
+libc = "0.2.113"
 socket2 = "0.4" # 0.5.1 has an MSRV of 1.63
 tracing = "0.1.10"
 

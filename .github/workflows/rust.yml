@@ -27,25 +27,23 @@ jobs:
             sh rustup.sh -y --profile minimal --default-toolchain stable
             echo "~~~~ rustc --version ~~~~"
             $HOME/.cargo/bin/rustc --version
-          run: |
+            echo "~~~~ freebsd-version ~~~~"
             freebsd-version
-            $HOME/.cargo/bin/cargo build --all-targets
-            $HOME/.cargo/bin/cargo test
-            $HOME/.cargo/bin/cargo test --manifest-path fuzz/Cargo.toml
+          run: $HOME/.cargo/bin/cargo build --all-targets && $HOME/.cargo/bin/cargo test && $HOME/.cargo/bin/cargo test --manifest-path fuzz/Cargo.toml
   test:
     strategy:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        rust: [stable, beta, 1.59.0]
+        rust: [stable, beta, 1.63.0]
         exclude:
           - os: macos-latest
             rust: beta
           - os: macos-latest
-            rust: 1.59.0
+            rust: 1.63.0
           - os: windows-latest
             rust: beta
           - os: windows-latest
-            rust: 1.59.0
+            rust: 1.63.0
 
     runs-on: ${{ matrix.os }}
 
